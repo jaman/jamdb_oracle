@@ -37,6 +37,7 @@
     fetch,
     sdu,
     server,
+    version = 0,  %% TNS protocol version from ACCEPT packet (e.g. 317)
     timeouts,
     cursors,
     defcols,
@@ -44,7 +45,11 @@
     env = [],
     passwd,
     req,
-    seq
+    seq,
+    crypto = undefined,  %% Encryption state for Oracle Native Network Encryption
+    crypto_algo = undefined,  %% Negotiated encryption algorithm ID (to be activated after auth)
+    integrity_algo = undefined,  %% Negotiated data integrity algorithm ID (MD5, SHA1, etc)
+    hash_state = undefined  %% Oracle network hash state (initialized after DH)
 }).
 
 -record(logon, {

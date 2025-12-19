@@ -1,7 +1,7 @@
 -module(jamdb_oracle_tns_encoder).
 
 %% API
--export([encode_packet/3]).
+-export([encode_packet/3, encode_packet/4]).
 -export([encode_record/2]).
 -export([encode_token/3]).
 -export([encode_str/1]).
@@ -10,7 +10,16 @@
 -include("jamdb_oracle.hrl").
 
 %% API
-encode_packet(?TNS_DATA, Data, Length) ->
+%% Encode packet with version awareness (for DATA packets after handshake)
+encode_packet(?TNS_DATA, Data, Length, Version) when Version >= 315 ->
+    PacketSize = byte_size(Data) + 10,
+    BodySize = Length - 10,
+    case Data of
+        <<PacketBody:BodySize/binary, Rest/bits>> when PacketSize > Length ->
+            {<<Length:32, ?TNS_DATA:8, 0:8, 0:16, 32:16, PacketBody/binary>>, Rest};
+        _ ->  {<<PacketSize:32, ?TNS_DATA:8, 0:8, 0:16, 0:16, Data/binary>>, <<>>}
+    end;
+encode_packet(?TNS_DATA, Data, Length, _Version) ->
     PacketSize = byte_size(Data) + 10,
     BodySize = Length - 10,
     case Data of
@@ -18,9 +27,15 @@ encode_packet(?TNS_DATA, Data, Length) ->
             {<<Length:16, 0:16, ?TNS_DATA:8, 0:8, 0:16, 32:16, PacketBody/binary>>, Rest};
         _ ->  {<<PacketSize:16, 0:16, ?TNS_DATA:8, 0:8, 0:16, 0:16, Data/binary>>, <<>>}
     end;
-encode_packet(Type, Data, _Length) ->
+encode_packet(Type, Data, _Length, _Version) ->
     PacketSize = byte_size(Data) + 8,
     {<<PacketSize:16, 0:16, Type:8, 0:8, 0:16, Data/binary>>, <<>>}.
+
+%% Backward compatibility - for non-DATA packets or when version not available
+encode_packet(?TNS_DATA, Data, Length) ->
+    encode_packet(?TNS_DATA, Data, Length, 0);
+encode_packet(Type, Data, Length) ->
+    encode_packet(Type, Data, Length, 0).
 
 encode_record(description, EnvOpts) ->
     {ok, UserHost}  = inet:gethostname(),
@@ -55,7 +70,7 @@ encode_record(login, #oraclient{env=EnvOpts,sdu=Sdu,auth=Desc}) ->
     (byte_size(Data)):16,    % Connect Data length
     0,58,                    % Connect Data offset
     0,0,0,0,                 % Max connect data that can be received
-    132,132,                 % ANO disabled
+    1,1,                     % ACFL0=1, ACFL1=1 (advertise advanced negotiation support)
     0:192,
     Data/binary
     >>;
@@ -170,7 +185,8 @@ encode_record(dty, #oraclient{charset=Charset}) ->
 encode_record(pro, _EnvOpts) ->
     <<
     ?TTI_PRO,
-    6,0,98,101,97,109,0
+    6,0,
+    "jamdb_oracle", 0
     >>;
 encode_record(spfp, #oraclient{seq=Tseq}) ->
     <<
