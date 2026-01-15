@@ -51,6 +51,18 @@ decode_two_task(<<Token, Data/binary>>, Acc) ->
         ?TTI_OER -> decode_token(oer, Data, Acc);
         ?TTI_STA -> {ok, Acc};     %tran
         ?TTI_FOB -> {error, fob};  %return
+        23 ->
+            %% Token 23 (0x17) - Oracle 12c+ extended warning/info token
+            %% Contains additional error/warning text after query results
+            decode_token(oer_ext, Data, Acc);
+        _ when Token >= 19 ->
+            %% Unknown/marker token - if we have accumulated results, return them
+            case Acc of
+                {RetCode, RowNumber, Cursor, {LCursor, RowFormat}, Rows} when Rows =/= [] ->
+                    {RetCode, RowNumber, Cursor, {LCursor, RowFormat}, Rows};
+                _ ->
+                    {error, <<Token, (hd(binary:split(Data, <<0>>)))/binary>>}
+            end;
         _ -> 
             {error, <<Token, (hd(binary:split(Data, <<0>>)))/binary>>}
     end.
@@ -258,7 +270,33 @@ decode_token(oer, Data, {Cursor, RowFormat, Rows}) ->
             Y = decode_next(dalc,X,4),
             {Cursor, decode_dalc(Y)}
     end,
-    {RetCode, RowNumber, Cursor, RetFormat, Rows}.
+    {RetCode, RowNumber, Cursor, RetFormat, Rows};
+%% Extended OER token (23/0x17) - Oracle 12c+ extended warning/error info
+%% This token appears after successful query results and contains additional info.
+%% We scan for the next valid TTI token to continue parsing, or return accumulated results.
+decode_token(oer_ext, Data, Acc) ->
+    case find_next_token(Data) of
+        {found, Token, Rest} ->
+            decode_two_task(<<Token, Rest/binary>>, Acc);
+        not_found ->
+            case Acc of
+                {0, RowFormat, []} when RowFormat =/= [] ->
+                    %% Column format present but no rows - "no data found" response
+                    {1403, 0, 0, {0, RowFormat}, []};
+                {Cursor, RowFormat, Rows} when is_list(Rows) ->
+                    {0, 0, Cursor, {0, RowFormat}, Rows};
+                _ ->
+                    {ok, Acc}
+            end
+    end.
+
+%% Scan for next valid TTI token in remaining data
+find_next_token(<<>>) -> not_found;
+find_next_token(<<Token, Rest/binary>>) when Token =:= 4; Token =:= 6; Token =:= 7; 
+                                              Token =:= 8; Token =:= 9; Token =:= 16 ->
+    {found, Token, Rest};
+find_next_token(<<_, Rest/binary>>) ->
+    find_next_token(Rest).
 
 decode_next(<<Length,Rest/bits>>) ->
     <<_Data:Length/binary,Rest2/bits>> = Rest,

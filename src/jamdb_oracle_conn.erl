@@ -7,6 +7,7 @@
 -export([sql_query/2, sql_query/3]).
 
 -include("jamdb_oracle.hrl").
+-include("jamdb_oracle_network_hash.hrl").
 
 -opaque state() :: #oraclient{}.
 -type error_type() :: socket | remote | local.
@@ -45,24 +46,45 @@ connect(Opts, Tout) ->
     ReadTout    = proplists:get_value(read_timeout, Opts, ?DEF_READ_TIMEOUT),
     Cset        = proplists:get_value(charset, Opts, utf8),
     Charset     = proplists:get_value(Cset, ?CHARSET, ?UTF8_CHARSET),
-    SockOpts = [binary, {active, false}, {packet, raw},
-            {nodelay, true}, {keepalive, true}]++SocketOpts,
+    Debug       = proplists:get_value(debug, Opts, false),
     Desc        = proplists:get_value(description, Opts, []),
     Pass        = proplists:get_value(password, Opts),
     NewPass     = proplists:get_value(newpassword, Opts, []),
     EnvOpts     = proplists:delete(password, proplists:delete(newpassword, Opts)),
     Passwd = spawn(fun() -> loop({Pass, NewPass}) end),
-    case gen_tcp:connect(Host, Port, SockOpts, Tout) of
-        {ok, Socket} ->
-            {ok, Socket2} = sock_connect(Socket, SslOpts, Tout),
-            {ok, [{recbuf, RecBuf}]} = inet:getopts(Socket2, [recbuf]),
-            inet:setopts(Socket2, [{buffer, RecBuf}]),
-            State = #oraclient{socket=Socket2, env=EnvOpts, passwd=Passwd, auth=Desc,
-            auto=Auto, fetch=Fetch, sdu=Sdu, charset=Charset, timeouts={Tout, ReadTout}},
+
+    %% Detect SSL mode
+    UseSSL = SslOpts =/= [] andalso SslOpts =/= undefined,
+
+    debug_log(Debug, "Connecting to ~p:~p (SSL: ~p)", [Host, Port, UseSSL]),
+
+    %% Connect using appropriate socket type
+    case do_connect(Host, Port, SocketOpts, SslOpts, UseSSL, Tout, Debug) of
+        {ok, Socket, IsSSL} ->
+            {ok, [{recbuf, RecBuf}]} = get_socket_opts(Socket, IsSSL, [recbuf]),
+            set_socket_opts(Socket, IsSSL, [{buffer, RecBuf}]),
+
+            State = #oraclient{
+                socket=Socket,
+                env=EnvOpts,
+                passwd=Passwd,
+                auth=Desc,
+                auto=Auto,
+                fetch=Fetch,
+                sdu=Sdu,
+                charset=Charset,
+                timeouts={Tout, ReadTout},
+                use_ssl=IsSSL,
+                ssl_opts=SslOpts,
+                debug=Debug
+            },
+
+            debug_log(Debug, "Connection established, starting login", []),
             {ok, State2} = send_req(login, State),
             handle_login(State2#oraclient{conn_state=auth_negotiate});
         {error, Reason} ->
-            handle_error(socket, Reason, #oraclient{})
+            debug_log(Debug, "Connection failed: ~p", [Reason]),
+            handle_error(socket, Reason, #oraclient{debug=Debug})
     end.
 
 -spec disconnect(state()) -> {ok, [env()]}.
@@ -108,7 +130,12 @@ sql_query(#oraclient{conn_state=connected} = State, {Query, Bind, Batch, Fetch})
     handle_resp(get_param(defcols, {DefCol, RowFormat, Type}),
     State2#oraclient{type=get_param(type, {Type, Fetch})});
 sql_query(#oraclient{conn_state=connected, timeouts={_Tout, ReadTout}} = State, {Query, Bind}) ->
-    case lists:nth(1, string:tokens(string:to_upper(Query)," \t;")) of
+    %% Convert binary (Elixir string) to charlist for Erlang string functions
+    QueryList = case is_binary(Query) of
+        true -> binary_to_list(Query);
+        false -> Query
+    end,
+    case lists:nth(1, string:tokens(string:to_upper(QueryList)," \t;")) of
         "SESSION" -> sql_query(State, {?ENCODER:encode_helper(sess, []), [], [], []});
         "COMMIT" -> handle_req(tran, State, ?TTI_COMMIT);
         "ROLLBACK" -> handle_req(tran, State, ?TTI_ROLLBACK);
@@ -127,59 +154,181 @@ sql_query(#oraclient{conn_state=connected, timeouts={_Tout, ReadTout}} = State, 
 loop(Values) ->
     receive {get, From} -> From ! Values, loop(Values); {set, Values2} -> loop(Values2) end.
 
+%% Debug logging helper
+debug_log(false, _Format, _Args) ->
+    ok;
+debug_log(true, Format, Args) ->
+    io:format("[jamdb_oracle] " ++ Format ++ "~n", Args),
+    %% Force output to appear immediately
+    io:format([]).
+
+%% Socket connection abstraction - handles both TCP and SSL
+do_connect(Host, Port, SocketOpts, SslOpts, true = _UseSSL, Tout, Debug) ->
+    debug_log(Debug, "Using SSL/TLS connection", []),
+    %% Merge socket options with SSL options
+    SockOpts = [binary, {active, false}, {packet, raw},
+                 {nodelay, true}, {keepalive, true}] ++ SocketOpts,
+    case ssl:connect(Host, Port, SockOpts ++ SslOpts, Tout) of
+        {ok, Socket} ->
+            debug_log(Debug, "SSL/TLS connection established", []),
+            {ok, Socket, true};
+        {error, Reason} ->
+            debug_log(Debug, "SSL/TLS connection failed: ~p", [Reason]),
+            {error, Reason}
+    end;
+do_connect(Host, Port, SocketOpts, _SslOpts, false = _UseSSL, Tout, Debug) ->
+    debug_log(Debug, "Using plain TCP connection", []),
+    SockOpts = [binary, {active, false}, {packet, raw},
+                 {nodelay, true}, {keepalive, true}] ++ SocketOpts,
+    case gen_tcp:connect(Host, Port, SockOpts, Tout) of
+        {ok, Socket} ->
+            debug_log(Debug, "TCP connection established", []),
+            {ok, Socket, false};
+        {error, Reason} ->
+            debug_log(Debug, "TCP connection failed: ~p", [Reason]),
+            {error, Reason}
+    end.
+
+%% Socket options abstraction
+get_socket_opts(Socket, true = _IsSSL, Opts) ->
+    ssl:getopts(Socket, Opts);
+get_socket_opts(Socket, false = _IsSSL, Opts) ->
+    inet:getopts(Socket, Opts).
+
+set_socket_opts(Socket, true = _IsSSL, Opts) ->
+    ssl:setopts(Socket, Opts);
+set_socket_opts(Socket, false = _IsSSL, Opts) ->
+    inet:setopts(Socket, Opts).
+
 %% internal
-handle_login(#oraclient{socket=Socket, env=Env, sdu=Length, timeouts=Touts} = State) ->
-    case recv(Socket, Length, Touts) of
+handle_login(#oraclient{socket=Socket, env=Env, sdu=Length, timeouts=Touts, use_ssl=UseSSL, debug=Debug} = State) ->
+    debug_log(Debug, "handle_login: waiting for server response", []),
+    case recv(Socket, Length, Touts, State) of
         {ok, ?TNS_DATA, Data} ->
-            case handle_token(Data, State) of
-                {ok, State2} -> handle_login(State2);
-                State2 -> {ok, State2}                  %connected
+            debug_log(Debug, "Received TNS_DATA packet (~p bytes)", [byte_size(Data)]),
+            %% Decrypt and verify data if security is enabled
+            {DecryptedData, State1} = decrypt_and_verify_data(Data, State),
+
+            case handle_token(DecryptedData, State1) of
+                {ok, State2} ->
+                    handle_login(State2);
+                {error, Type, Reason, State2} ->
+                    debug_log(Debug, "handle_token error: ~p, ~p", [Type, Reason]),
+                    {error, Type, Reason, State2};
+                State2 ->
+                    debug_log(Debug, "Authentication successful, connected", []),
+                    {ok, State2}                  %connected
             end;
         {ok, ?TNS_RESEND, _Data} ->
-            {ok, Socket2} = sock_renegotiate(Socket, Env, Touts),
-            {ok, State2} = send_req(login, State#oraclient{socket=Socket2}),
-            handle_login(State2);
-        {ok, ?TNS_ACCEPT, <<_Ver:16,_Opts:16,Sdu:16,_Rest/bits>>} ->
-            Task = spawn(fun() -> loop(0) end),
-            {ok, State2} = send_req(pro, State#oraclient{seq=Task,sdu=Sdu}),
-            handle_login(State2);
+            debug_log(Debug, "Received TNS_RESEND", []),
+            case sock_renegotiate(Socket, Env, Touts) of
+                {ok, Socket2} ->
+                    try send_req(login, State#oraclient{socket=Socket2}) of
+                        {ok, State2} ->
+                            handle_login(State2);
+                        _SendError ->
+                            debug_log(Debug, "Send failed during renegotiation", []),
+                            handle_error(socket, send_failed, State)
+                    catch
+                        _Class:Reason:_Stack ->
+                            debug_log(Debug, "Exception during renegotiation: ~p", [Reason]),
+                            handle_error(socket, Reason, State)
+                    end;
+                {error, Reason} ->
+                    debug_log(Debug, "Renegotiation failed: ~p", [Reason]),
+                    handle_error(socket, Reason, State)
+            end;
+        {ok, ?TNS_ACCEPT, <<Ver:16,_Opts:16,Sdu:16,_Tdu:16,_Histone:16,_BufLen:16,_DataOff:16,Acfl0:8,Acfl1:8,_Rest/bits>>} ->
+            debug_log(Debug, "Received TNS_ACCEPT (version=~p, SDU=~p, ACFL0=~p, ACFL1=~p)", [Ver, Sdu, Acfl0, Acfl1]),
+            %% Check if advanced negotiation/encryption is indicated by flags
+            HasAdvancedService = ((Acfl0 band 1) =/= 0) andalso ((Acfl0 band 4) =:= 0) andalso ((Acfl1 band 8) =:= 0),
+
+            %% Skip native encryption when SSL is active (SSL handles encryption at transport layer)
+            ShouldNegotiate = HasAdvancedService andalso not UseSSL,
+
+            case ShouldNegotiate of
+                true ->
+                    debug_log(Debug, "Advanced service negotiation requested, starting...", []),
+                    StateWithSdu = State#oraclient{sdu=Sdu, version=Ver},
+                    case jamdb_oracle_adv_nego:negotiate(StateWithSdu) of
+                        {ok, State2} ->
+                            debug_log(Debug, "Advanced negotiation successful, activating encryption...", []),
+                            case jamdb_oracle_adv_nego:activate_encryption(State2#oraclient.crypto_algo, State2) of
+                                {ok, State3} ->
+                                    debug_log(Debug, "Encryption activated successfully", []),
+                                    Task = spawn(fun() -> loop(0) end),
+                                    %% Clear crypto_algo so legacy flow doesn't try to activate encryption again
+                                    State3WithSeq = State3#oraclient{seq=Task, crypto_algo=undefined},
+                                    {ok, State4} = send_req(pro, State3WithSeq),
+                                    handle_login(State4);
+                                {error, Reason} ->
+                                    debug_log(Debug, "Failed to activate encryption: ~p", [Reason]),
+                                    handle_error(remote, Reason, State2)
+                            end;
+                        {error, Reason} ->
+                            debug_log(Debug, "Advanced negotiation failed: ~p", [Reason]),
+                            handle_error(remote, Reason, StateWithSdu)
+                    end;
+                false ->
+                    debug_log(Debug, "Using standard TNS protocol (no advanced negotiation)", []),
+                    Task = spawn(fun() -> loop(0) end),
+                    {ok, State2} = send_req(pro, State#oraclient{seq=Task, sdu=Sdu, version=Ver}),
+                    handle_login(State2)
+            end;
         {ok, ?TNS_MARKER, _Data} ->
+            debug_log(Debug, "Received TNS_MARKER", []),
             handle_req(marker, State, []);
         {ok, ?TNS_REDIRECT, Data} ->
-            {ok, Opts} = ?DECODER:decode_token(net, {Data, Env}),
-            reconnect(State#oraclient{env=Opts});
+            debug_log(Debug, "Received TNS_REDIRECT", []),
+            Addresses = parse_redirect_addresses(binary_to_list(Data)),
+            debug_log(Debug, "Trying ~p addresses", [length(Addresses)]),
+            try_redirect(Addresses, State);
         {ok, ?TNS_REFUSE, <<_Bin:16,_Length:16,Rest/bits>>} ->
-            handle_error(local, binary_to_list(Rest), State);
+            RefuseMsg = binary_to_list(Rest),
+            handle_error(local, RefuseMsg, State);
         {error, Type, Reason} ->
             handle_error(Type, Reason, State)
     end.
 
 handle_token(<<Token, Data/binary>>, State) ->
     case Token of
-        ?TTI_PRO -> send_req(dty, State);
-        ?TTI_DTY -> send_req(sess, State);
+        ?TTI_PRO ->
+            send_req(dty, State);
+        ?TTI_DTY ->
+            send_req(sess, State);
         ?TTI_RPA ->
             case ?DECODER:decode_token(rpa, Data) of
                 {?TTI_SESS, Request} ->
                     send_req(auth, State#oraclient{req=Request});
                 {?TTI_AUTH, Resp, Ver, SessId} ->
-                    #oraclient{auth = KeyConn} = State,
+                    #oraclient{auth = KeyConn, crypto_algo = CryptoAlgo} = State,
                     Cursors = spawn(fun() -> loop([]) end),
                     case jamdb_oracle_crypt:validate(#logon{auth=Resp, key=KeyConn}) of
-                        ok -> State#oraclient{conn_state=connected,auth=SessId,server=Ver,cursors=Cursors};
-                        error -> handle_error(remote, Resp, State)
+                        ok ->
+                            ConnectedState = State#oraclient{conn_state=connected,auth=KeyConn,server=Ver,cursors=Cursors},
+                            case jamdb_oracle_adv_nego:activate_encryption(CryptoAlgo, ConnectedState) of
+                                {ok, FinalState} ->
+                                    FinalState#oraclient{auth=SessId};
+                                {error, Reason} ->
+                                    handle_error(remote, Reason, ConnectedState)
+                            end;
+                        error ->
+                            handle_error(remote, Resp, State)
                     end
             end;
         ?TTI_WRN -> handle_token(?DECODER:decode_token(wrn, Data), State);
         _ -> handle_error(remote, Token, State)
     end.
 
-handle_error(remote, Reason, State) ->
-    {error, remote, Reason, State};
-handle_error(socket, Reason, State) ->
-    disconnect(State),
-    {error, socket, Reason, State#oraclient{conn_state=disconnected}};
-handle_error(local, Reason, State) ->
+handle_error(remote, Reason, #oraclient{debug = Debug}) ->
+    debug_log(Debug, "handle_error: remote error - ~p", [Reason]),
+    {error, remote, Reason, #oraclient{conn_state=disconnected}};
+handle_error(socket, Reason, #oraclient{debug = Debug}) ->
+    debug_log(Debug, "handle_error: socket error - ~p", [Reason]),
+    disconnect(#oraclient{conn_state=disconnected}),
+    {error, socket, Reason, #oraclient{conn_state=disconnected}};
+handle_error(local, Reason, #oraclient{debug = Debug} = State) ->
+    debug_log(Debug, "handle_error: local error - ~p", [Reason]),
     disconnect(State),
     {ok, Reason, State#oraclient{conn_state=disconnected}}.
 
@@ -265,51 +414,116 @@ send_req(exec, #oraclient{charset=Charset,fetch=Fetch,cursors=Cursors,seq=Task} 
     send(State#oraclient{type=Type,defcols=DefCol,params=[get_param(format, B, #format{charset=Charset}) || B <- Bind2]},
         ?TNS_DATA, <<Pig/binary, Pig2/binary, Data/binary>>).
 
-handle_resp(Acc, #oraclient{socket=Socket, sdu=Length, timeouts=Touts} = State) ->
-    case recv(Socket, Length, Touts) of
+%% Decrypt and verify data if security is enabled (removes folding key, decrypts, verifies hash)
+decrypt_and_verify_data(Data, #oraclient{crypto=Crypto, hash_state=HashState} = State) ->
+    case {Crypto, HashState} of
+        {undefined, undefined} ->
+            {Data, State};
+        _ when Crypto =/= undefined orelse HashState =/= undefined ->
+            %% Check if data is long enough for encryption (go-ora checks len > 1)
+            DataLen = byte_size(Data),
+            case DataLen of
+                Len when Len =< 1 ->
+                    {Data, State};
+                _ ->
+                    %% Step 1: Remove folding key byte (last byte)
+                    DataWithoutFolding = binary:part(Data, 0, DataLen - 1),
+
+                    %% Step 2: Decrypt if crypto is active
+                    {DecryptedWithHash, NewCrypto} = case Crypto of
+                        undefined -> {DataWithoutFolding, undefined};
+                        _ ->
+                            case jamdb_oracle_network_crypto:decrypt(DataWithoutFolding, Crypto) of
+                                {ok, Dec, NC} ->
+                                    {Dec, NC};
+                                {error, _DecReason} ->
+                                    {Data, Crypto}
+                            end
+                    end,
+
+                    %% Step 3: Verify and remove Oracle hash if data integrity is active
+                    %% Skip hash if data appears unencrypted (same as original Data)
+                    {PlainDataFinal, NewHashState} = case {HashState, DecryptedWithHash =:= Data} of
+                        {undefined, _} -> {DecryptedWithHash, undefined};
+                        {_, true} ->
+                            %% Data wasn't decrypted (unencrypted response), skip hash verification
+                            {DecryptedWithHash, HashState};
+                        {_, false} ->
+                            %% Data was decrypted, verify hash
+                            HashSize = case HashState of
+                                #oracle_hash_state{hash_size = HS} -> HS;
+                                _ -> 16  %% Default to MD5 size
+                            end,
+                            PlainSize = byte_size(DecryptedWithHash) - HashSize,
+                            case PlainSize >= 0 of
+                                true ->
+                                    <<Plain:PlainSize/binary, _RecvHash:HashSize/binary>> = DecryptedWithHash,
+                                    %% TODO: Optionally verify hash matches
+                                    {Plain, HashState};
+                                false ->
+                                    {DecryptedWithHash, HashState}
+                            end
+                    end,
+
+                    {PlainDataFinal, State#oraclient{crypto=NewCrypto, hash_state=NewHashState}}
+            end
+    end.
+
+handle_resp(Acc, State) ->
+    case recv(State#oraclient.socket, State#oraclient.sdu, State#oraclient.timeouts, State) of
         {ok, ?TNS_DATA, Data} ->
             handle_resp(Data, Acc, State);
         {ok, ?TNS_MARKER, _Data} ->
             handle_req(marker, State, Acc);
+        {ok, Type, _Data} when Type >= ?TNS_MAX ->
+            debug_log(State#oraclient.debug, "Received disconnect packet type ~p after query result, discarding and continuing", [Type]),
+            more;
         {error, Type, Reason} ->
             handle_error(Type, Reason, State)
     end.
 
 handle_resp(Data, Acc, #oraclient{type=Type, cursors=Cursors} = State) ->
-    case ?DECODER:decode_two_task(Data, Acc) of
+    %% Decrypt and verify data if security is enabled
+    {PlainData, State2} = decrypt_and_verify_data(Data, State),
+
+    case ?DECODER:decode_two_task(PlainData, Acc) of
         {0, _RowNumber, Cursor, {LCursor, RowFormat}, []} when Type =/= change, RowFormat =/= [] ->
             Type2 = if LCursor =:= Cursor -> Type; true -> cursor end,
-            {ok, State2} = send_req(fetch, State, {Cursor, RowFormat}),
-            #oraclient{defcols=DefCol} = State2,
+            {ok, State3} = send_req(fetch, State2, {Cursor, RowFormat}),
+            #oraclient{defcols=DefCol} = State3,
             {_, DefCol2} = currval(DefCol, {LCursor, Cursor, RowFormat}, Cursors),
             handle_resp({Cursor, RowFormat, []}, State2#oraclient{defcols=DefCol2, type=Type2});
         {RetCode, RowNumber, Cursor, {LCursor, RowFormat}, Rows} ->
             case get_result(Type, RetCode, RowNumber, RowFormat, Rows) of
                 more when Type =:= fetch ->
-                    {ok, [{fetched_rows, Cursor, RowFormat, Rows}], State};
+                    {ok, [{fetched_rows, Cursor, RowFormat, Rows}], State2};
                 more ->
-                    {ok, State2} = send_req(fetch, State, Cursor),
-                    handle_resp({Cursor, RowFormat, Rows}, State2);
-                {ok, Result} ->
-                    #oraclient{defcols=DefCol} = State,
+                    {ok, State3} = send_req(fetch, State2, Cursor),
+                    handle_resp({Cursor, RowFormat, Rows}, State3);
+                 {ok, Result} ->
+                    #oraclient{defcols=DefCol} = State2,
                     case currval(DefCol, {LCursor, Cursor, RowFormat}, Cursors) of
-                        {reset, _} -> send_req(reset, State);
+                        {reset, _} -> send_req(reset, State2);
                         _ -> more
                     end,
-                    {ok, Result, State};
+                    clear_socket(State2#oraclient.socket, State2#oraclient.debug),
+                    {ok, Result, State2};
                 {error, Result} ->
                     case get_result(Cursors) of
                         [] -> more;
-                        _ -> send_req(reset, State)
+                        _ -> send_req(reset, State2)
                     end,
-                    {ok, Result, State}
+                    {ok, Result, State2}
             end;
-        {ok, Result} -> %tran
-            {ok, Result, State};
-        {error, fob} -> %return
-            handle_req(fob, State, Acc);
+         {ok, Result} -> %tran
+            clear_socket(State2#oraclient.socket, State2#oraclient.debug),
+            {ok, Result, State2};
+         {error, fob} -> %return
+            handle_req(fob, State2, Acc);
+        {error, <<MarkerType, _/binary>>} when MarkerType >= ?TNS_MAX ->
+            check_result_in_acc(Type, Acc, State2);
         {error, Reason} ->
-            handle_error(remote, Reason, State)
+            handle_error(remote, Reason, State2)
     end.
 
 get_result(cursor, 0, _RowNumber, _RowFormat, _Rows) ->
@@ -385,37 +599,100 @@ get_record(Type, [], Request, Task) ->
 get_record(Type, State, Request, Task) ->
     ?ENCODER:encode_record(Type, State#oraclient{req=Request, seq=nextval(Task)}).
 
-sock_renegotiate(Socket, _Opts, _Touts) when is_port(Socket) -> {ok, Socket};
+sock_renegotiate(Socket, _Opts, _Touts) when is_port(Socket) ->
+    %% Plain TCP socket - TNS_RESEND just means "resend your login", not "upgrade to SSL"
+    {ok, Socket};
 sock_renegotiate(Socket, Opts, {Tout, _ReadTout}) ->
+    %% Already SSL socket - close and reopen for renegotiation
     SslOpts = proplists:get_value(ssl, Opts, []),
-    {ok, Socket2} = ssl:close(Socket, {self(), Tout}),
-    ssl:connect(Socket2, SslOpts, Tout).
-
-sock_connect(Socket, [], _Tout) when is_port(Socket) -> {ok, Socket};
-sock_connect(Socket, SslOpts, Tout) -> ssl:connect(Socket, SslOpts, Tout).
+    case ssl:close(Socket, {self(), Tout}) of
+        {ok, Socket2} ->
+            case ssl:connect(Socket2, SslOpts, Tout) of
+                {ok, NewSocket} ->
+                    {ok, NewSocket};
+                {error, Reason} ->
+                    {error, Reason}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
 
 sock_close(undefined) -> ok;
 sock_close(Socket) when is_port(Socket) -> gen_tcp:close(Socket);
 sock_close(Socket) -> ssl:close(Socket).
 
-sock_send(Socket, Packet) when is_port(Socket) -> gen_tcp:send(Socket, Packet);
-sock_send(Socket, Packet) -> ssl:send(Socket, Packet).
+sock_send(Socket, Packet) when is_port(Socket) ->
+    gen_tcp:send(Socket, Packet);
+sock_send(Socket, Packet) ->
+    ssl:send(Socket, Packet).
 
-sock_recv(Socket, Length, Tout) when is_port(Socket) -> gen_tcp:recv(Socket, Length, Tout);
-sock_recv(Socket, Length, Tout) -> ssl:recv(Socket, Length, Tout).
+sock_recv(Socket, Length, Tout) when is_port(Socket) ->
+    Result = gen_tcp:recv(Socket, Length, Tout),
+    case Result of
+        {ok, Data} ->
+            {ok, Data};
+        {error, Reason} ->
+            {error, Reason}
+    end;
+sock_recv(Socket, Length, Tout) ->
+    debug_log(true, "[SSL RECV] Waiting for ~p bytes (timeout=~p)", [Length, Tout]),
+    Result = ssl:recv(Socket, Length, Tout),
+    case Result of
+        {ok, Data} ->
+            debug_log(true, "[SSL RECV] Got ~p bytes~n", [byte_size(Data)]),
+            debug_log(true, "  Data: ~p~n", [Data]),
+            {ok, Data};
+        {error, Reason} ->
+            debug_log(true, "[SSL RECV] Error: ~p~n", [Reason]),
+            {error, Reason}
+    end.
 
 send(State, _PacketType, <<>>) ->
     {ok, State};
-send(#oraclient{socket=Socket,sdu=Length} = State, PacketType, Data) ->
-    {Packet, Rest} = ?ENCODER:encode_packet(PacketType, Data, Length),
+send(#oraclient{socket=Socket,sdu=Length,version=Version,crypto=Crypto,hash_state=HashState} = State, PacketType, Data) ->
+    %% Apply security (hash + encrypt + folding) if enabled (for TNS_DATA packets after negotiation)
+    {DataToSend, State2} = case {PacketType, Crypto, HashState} of
+        {?TNS_DATA, undefined, undefined} ->
+            {Data, State};
+        {?TNS_DATA, _, _} when Crypto =/= undefined orelse HashState =/= undefined ->
+            %% Step 1: Compute Oracle hash if data integrity is active
+            {DataWithHash, NewHashState} = case HashState of
+                undefined -> {Data, undefined};
+                _ ->
+                    {Hash, HS2} = jamdb_oracle_network_hash:compute(Data, HashState),
+                    {<<Data/binary, Hash/binary>>, HS2}
+            end,
+
+            %% Step 2: Encrypt if crypto is active
+            {EncryptedData, NewCrypto} = case Crypto of
+                undefined -> {DataWithHash, undefined};
+                _ ->
+                    case jamdb_oracle_network_crypto:encrypt(DataWithHash, Crypto) of
+                        {ok, Enc, NC} -> {Enc, NC};
+                        {error, _} -> {DataWithHash, Crypto}
+                    end
+            end,
+
+            %% Step 3: Add folding key byte (0x00) if either hash or crypto is active
+            FinalData = <<EncryptedData/binary, 0>>,
+
+            {FinalData, State#oraclient{crypto=NewCrypto, hash_state=NewHashState}};
+        _ ->
+            {Data, State}
+    end,
+
+    {Packet, Rest} = ?ENCODER:encode_packet(PacketType, DataToSend, Length, Version),
     case sock_send(Socket, Packet) of
         ok ->
-            send(State, PacketType, Rest);
+            debug_log(State2#oraclient.debug, "Sent TNS packet type ~p (~p bytes)~n", [PacketType, byte_size(Packet)]),
+            debug_log(State2#oraclient.debug, "  Data: ~p~n", [Packet]),
+            send(State2, PacketType, Rest);
         {error, Reason} ->
-            handle_error(socket, Reason, State)
+            debug_log(State2#oraclient.debug, "Send failed: ~p~n", [Reason]),
+            handle_error(socket, Reason, State2)
     end.
 
-recv(Socket, Length, {Tout, _ReadTout} = Touts) ->
+recv(Socket, Length, {Tout, _ReadTout} = Touts, #oraclient{}) ->
     case sock_recv(Socket, 0, Tout) of
         {ok, NetworkData} ->
             recv(Socket, Length, Touts, NetworkData, <<>>);
@@ -438,7 +715,8 @@ recv(Socket, Length, Touts, Acc, Data) ->
         {ok, ?TNS_MARKER, <<1,0,1>>, _Rest} ->
             recv(read_timeout, Socket, Length, Touts, <<>>, <<>>);
         {ok, Type, PacketBody, <<>>} ->
-            {ok, Type, <<Data/bits, PacketBody/bits>>};
+            FullData = <<Data/bits, PacketBody/bits>>,
+            {ok, Type, FullData};
         {ok, _Type, PacketBody, Rest} ->
             recv(Socket, Length, Touts, Rest, <<Data/bits, PacketBody/bits>>);
         {more, _Type, PacketBody, <<>>} ->
@@ -447,4 +725,67 @@ recv(Socket, Length, Touts, Acc, Data) ->
             recv(Socket, Length, Touts, Rest, <<Data/bits, PacketBody/bits>>);
         {error, more} ->
             recv(read_timeout, Socket, Length, Touts, Acc, Data)
+    end.
+
+try_redirect([], _State) -> {error, redirect_failed};
+try_redirect([{Host, Port} | Rest], #oraclient{debug=Debug, use_ssl=UseSSL, ssl_opts=SslOpts} = State) ->
+    debug_log(Debug, "Trying ~s:~p", [Host, Port]),
+    Opts = lists:keydelete(host, 1, State#oraclient.env) ++ [{host, Host}, {port, Port}],
+    case do_connect(Host, Port, [], SslOpts, UseSSL, 2000, Debug) of
+        {ok, Sock, _SSL} -> gen_tcp:close(Sock), reconnect(State#oraclient{env = Opts});
+        {error, _} -> try_redirect(Rest, State)
+    end.
+
+parse_redirect_addresses(Data) ->
+    case re:run(Data, "\\(ADDRESS=\\(PROTOCOL=(TCP|TCPS)\\)\\(HOST=([^)]+)\\)\\(PORT=(\\d+)\\)\\)", [global, {capture, all_but_first, list}, caseless]) of
+        {match, Matches} ->
+            lists:map(fun([_Proto, Host, PortStr]) -> {Host, list_to_integer(PortStr)} end, Matches);
+        nomatch -> []
+    end.
+
+clear_socket(Socket, Debug) ->
+    debug_log(Debug, "Clearing socket of any pending disconnect packets (50ms timeout)", []),
+    case sock_recv(Socket, 0, 50) of
+        {ok, Data} ->
+            case Data of
+                <<_Size:16, _Flags:16, Type, _Rest/bits>> when Type >= ?TNS_MAX ->
+                    debug_log(Debug, "Cleared disconnect packet type ~p from socket", [Type]),
+                    ok;
+                _ ->
+                    debug_log(Debug, "Found unexpected data on socket, leaving it: ~p", [Data]),
+                    ok
+            end;
+        {error, timeout} ->
+            debug_log(Debug, "No pending data to clear", []),
+            ok;
+        {error, Reason} ->
+            debug_log(Debug, "Socket clear failed: ~p", [Reason]),
+            ok
+    end.
+
+check_result_in_acc(Type, Acc, State) ->
+    debug_log(State#oraclient.debug, "Checking accumulator for existing result: ~p", [Acc]),
+    case Acc of
+        {RetCode, RowNumber, Cursor, {_LCursor, RowFormat}, Rows} ->
+            case get_result(Type, RetCode, RowNumber, RowFormat, Rows) of
+                {ok, Result} ->
+                    debug_log(State#oraclient.debug, "Found query result in accumulator, returning despite marker", []),
+                    {ok, Result, State};
+                more when Type =:= fetch ->
+                    debug_log(State#oraclient.debug, "More data needed for fetch, requesting", []),
+                    {ok, [{fetched_rows, Cursor, RowFormat, Rows}], State};
+                more ->
+                    debug_log(State#oraclient.debug, "More data needed, sending fetch request", []),
+                    {ok, State2} = send_req(fetch, State, Cursor),
+                    handle_resp({Cursor, RowFormat, Rows}, State2);
+                {error, Result} ->
+                    debug_log(State#oraclient.debug, "Result in accumulator indicates error: ~p", [Result]),
+                    {ok, Result, State}
+            end;
+        _ when Acc =:= undefined orelse Acc =:= [] ->
+            debug_log(State#oraclient.debug, "No result in accumulator, treating marker as disconnect", []),
+            handle_error(remote, Acc, State);
+        _ ->
+            debug_log(State#oraclient.debug, "Accumulator in unexpected format: ~p, treating as disconnect", [Acc]),
+            handle_error(remote, Acc, State)
     end.

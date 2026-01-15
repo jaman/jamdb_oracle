@@ -12,7 +12,7 @@ defmodule Jamdb.Oracle.Mixfile do
 
   def application do
     [
-      extra_applications: [:crypto, :public_key]
+      extra_applications: [:crypto, :public_key, :runtime_tools]
     ]
   end
 
