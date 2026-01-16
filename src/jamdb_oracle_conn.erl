@@ -506,7 +506,6 @@ handle_resp(Data, Acc, #oraclient{type=Type, cursors=Cursors} = State) ->
                         {reset, _} -> send_req(reset, State2);
                         _ -> more
                     end,
-                    clear_socket(State2#oraclient.socket, State2#oraclient.debug),
                     {ok, Result, State2};
                 {error, Result} ->
                     case get_result(Cursors) of
@@ -516,7 +515,6 @@ handle_resp(Data, Acc, #oraclient{type=Type, cursors=Cursors} = State) ->
                     {ok, Result, State2}
             end;
          {ok, Result} -> %tran
-            clear_socket(State2#oraclient.socket, State2#oraclient.debug),
             {ok, Result, State2};
          {error, fob} -> %return
             handle_req(fob, State2, Acc);
@@ -741,26 +739,6 @@ parse_redirect_addresses(Data) ->
         {match, Matches} ->
             lists:map(fun([_Proto, Host, PortStr]) -> {Host, list_to_integer(PortStr)} end, Matches);
         nomatch -> []
-    end.
-
-clear_socket(Socket, Debug) ->
-    debug_log(Debug, "Clearing socket of any pending disconnect packets (50ms timeout)", []),
-    case sock_recv(Socket, 0, 50) of
-        {ok, Data} ->
-            case Data of
-                <<_Size:16, _Flags:16, Type, _Rest/bits>> when Type >= ?TNS_MAX ->
-                    debug_log(Debug, "Cleared disconnect packet type ~p from socket", [Type]),
-                    ok;
-                _ ->
-                    debug_log(Debug, "Found unexpected data on socket, leaving it: ~p", [Data]),
-                    ok
-            end;
-        {error, timeout} ->
-            debug_log(Debug, "No pending data to clear", []),
-            ok;
-        {error, Reason} ->
-            debug_log(Debug, "Socket clear failed: ~p", [Reason]),
-            ok
     end.
 
 check_result_in_acc(Type, Acc, State) ->
